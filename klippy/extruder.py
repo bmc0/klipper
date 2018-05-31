@@ -164,71 +164,38 @@ class PrinterExtruder:
         cruise_d = move.cruise_r * axis_d
         decel_d = move.decel_r * axis_d
 
-        retract_t = retract_d = retract_v = 0.
-        decel_v = cruise_v
-
-        # Update for pressure advance
-        start_pos = self.extrude_pos
+        pressure_advance = 0.
         if (axis_d >= 0. and (move.axes_d[0] or move.axes_d[1])
             and self.pressure_advance):
-            # Increase accel_d and start_v when accelerating
             pressure_advance = self.pressure_advance * move.extrude_r
-            prev_pressure_d = start_pos - move.start_pos[3]
-            if accel_d:
-                npd = move.cruise_v * pressure_advance
-                extra_accel_d = npd - prev_pressure_d
-                if extra_accel_d > 0.:
-                    accel_d += extra_accel_d
-                    start_v += extra_accel_d / accel_t
-                    prev_pressure_d += extra_accel_d
-            # Update decel and retract parameters when decelerating
-            emcv = move.extrude_max_corner_v
-            if decel_d and emcv < move.cruise_v:
-                npd = max(emcv, move.end_v) * pressure_advance
-                extra_decel_d = prev_pressure_d - npd
-                if extra_decel_d > 0.:
-                    extra_decel_v = extra_decel_d / decel_t
-                    decel_v -= extra_decel_v
-                    end_v -= extra_decel_v
-                    if decel_v <= 0.:
-                        # The entire decel phase is replaced with retraction
-                        retract_t = decel_t
-                        retract_d = -(end_v + decel_v) * 0.5 * decel_t
-                        retract_v = -decel_v
-                        decel_t = decel_d = 0.
-                    elif end_v < 0.:
-                        # Split decel phase into decel and retraction
-                        retract_t = -end_v / accel
-                        retract_d = -end_v * 0.5 * retract_t
-                        decel_t -= retract_t
-                        decel_d = decel_v * 0.5 * decel_t
-                    else:
-                        # There is still only a decel phase (no retraction)
-                        decel_d -= extra_decel_d
 
         # Prepare for steps
-        step_const = self.stepper.step_const
+        step_const_adv = self.stepper.step_const_adv
         move_time = print_time
+        start_pos = self.extrude_pos
+        prev_pressure_d = start_pos - move.start_pos[3]
 
-        # Acceleration steps
         if accel_d:
-            step_const(move_time, start_pos, accel_d, start_v, accel)
-            start_pos += accel_d
+            extra_accel_d = 0.
+            if pressure_advance:
+                npd = move.cruise_v * pressure_advance
+                extra_accel_d = max(npd - prev_pressure_d, 0.)
+            step_const_adv(move_time, start_pos, accel_d, start_v, accel, extra_accel_d)
+            start_pos += accel_d + extra_accel_d
             move_time += accel_t
-        # Cruising steps
+            prev_pressure_d += extra_accel_d
         if cruise_d:
-            step_const(move_time, start_pos, cruise_d, cruise_v, 0.)
+            step_const_adv(move_time, start_pos, cruise_d, cruise_v, 0., 0.)
             start_pos += cruise_d
             move_time += cruise_t
-        # Deceleration steps
         if decel_d:
-            step_const(move_time, start_pos, decel_d, decel_v, -accel)
-            start_pos += decel_d
-            move_time += decel_t
-        # Retraction steps
-        if retract_d:
-            step_const(move_time, start_pos, -retract_d, retract_v, accel)
-            start_pos -= retract_d
+            emcv = move.extrude_max_corner_v
+            extra_decel_d = 0.
+            if pressure_advance and emcv < move.cruise_v:
+                npd = max(emcv, move.end_v) * pressure_advance
+                extra_decel_d = min(npd - prev_pressure_d, 0.)
+            step_const_adv(move_time, start_pos, decel_d, cruise_v, -accel, extra_decel_d)
+            start_pos += decel_d + extra_decel_d
         self.extrude_pos = start_pos
     cmd_SET_PRESSURE_ADVANCE_help = "Set pressure advance parameters"
     def cmd_default_SET_PRESSURE_ADVANCE(self, params):

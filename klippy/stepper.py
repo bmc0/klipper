@@ -49,6 +49,7 @@ class PrinterStepper:
         self.mcu_stepper.setup_step_distance(self.step_dist)
         self.step = self.mcu_stepper.step
         self.step_const = self.mcu_stepper.step_const
+        self.step_const_adv = self.mcu_stepper.step_const_adv
         self.step_delta = self.mcu_stepper.step_delta
         self.enable = lookup_enable_pin(ppins, config.get('enable_pin', None))
         # Register STEPPER_BUZZ command
@@ -207,6 +208,7 @@ class PrinterMultiStepper(PrinterHomingStepper):
         self.endstops = PrinterHomingStepper.get_endstops(self)
         self.extras = []
         self.all_step_const = [self.step_const]
+        self.all_step_const_adv = [self.step_const_adv]
         for i in range(1, 99):
             if not config.has_section(config.get_name() + str(i)):
                 break
@@ -214,6 +216,7 @@ class PrinterMultiStepper(PrinterHomingStepper):
             extra = PrinterStepper(printer, extraconfig)
             self.extras.append(extra)
             self.all_step_const.append(extra.step_const)
+            self.all_step_const_adv.append(extra.step_const_adv)
             extraendstop = extraconfig.get('endstop_pin', None)
             if extraendstop is not None:
                 ppins = printer.lookup_object('pins')
@@ -223,9 +226,13 @@ class PrinterMultiStepper(PrinterHomingStepper):
             else:
                 self.mcu_endstop.add_stepper(extra.mcu_stepper)
         self.step_const = self.step_multi_const
+        self.step_const_adv = self.step_multi_const_adv
     def step_multi_const(self, print_time, start_pos, dist, start_v, accel):
         for step_const in self.all_step_const:
             step_const(print_time, start_pos, dist, start_v, accel)
+    def step_multi_const_adv(self, print_time, start_pos, dist, start_v, accel, advance_d):
+        for step_const_adv in self.all_step_const_adv:
+            step_const_adv(print_time, start_pos, dist, start_v, accel, advance_d)
     def set_max_jerk(self, max_halt_velocity, max_accel):
         PrinterHomingStepper.set_max_jerk(self, max_halt_velocity, max_accel)
         for extra in self.extras:

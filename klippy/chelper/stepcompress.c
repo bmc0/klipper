@@ -20,6 +20,8 @@
 #include <stdio.h> // fprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include <gsl/gsl_errno.h>
+#include <gsl/gsl_poly.h>
 #include "pyhelper.h" // errorf
 #include "serialqueue.h" // struct queue_message
 
@@ -581,6 +583,282 @@ stepcompress_push_const(
         queue_append_finish(qa);
     }
     return res;
+}
+
+/* The code supports order 3 and 5 */
+#define BEZIER_ORDER 3
+
+#if BEZIER_ORDER == 3
+    #define BEZIER_3RD_ORDER
+#elif BEZIER_ORDER == 5
+    #define BEZIER_5TH_ORDER
+#else
+    #error "Unsupported BEZIER_ORDER"
+#endif
+
+struct bezier {
+    double f[BEZIER_ORDER + 2], fp[BEZIER_ORDER + 1];
+};
+
+static void
+init_bezier(struct bezier *b, double start_sv, double end_sv, double advance_sd)
+{
+    double sv_delta = end_sv - start_sv;
+    #if defined(BEZIER_3RD_ORDER)
+        b->f[4] = -.5 * sv_delta;
+        b->f[3] = (1. * sv_delta) + (-2. * advance_sd);
+        b->f[2] = 3. * advance_sd;
+        b->f[1] = start_sv;
+        b->f[0] = 0.;
+
+        b->fp[3] = -2. * sv_delta;
+        b->fp[2] = (3. * sv_delta) + (-6. * advance_sd);
+        b->fp[1] = 6. * advance_sd;
+        b->fp[0] = start_sv;
+    #elif defined(BEZIER_5TH_ORDER)
+        b->f[6] = 1. * sv_delta;
+        b->f[5] = (-3. * sv_delta) + (6. * advance_sd);
+        b->f[4] = (2.5 * sv_delta) + (-15. * advance_sd);
+        b->f[3] = 10. * advance_sd;
+        b->f[2] = 0.;
+        b->f[1] = start_sv;
+        b->f[0] = 0.;
+
+        b->fp[5] = 6. * sv_delta;
+        b->fp[4] = (-15. * sv_delta) + (30. * advance_sd);
+        b->fp[3] = (10. * sv_delta) + (-60. * advance_sd);
+        b->fp[2] = 30. * advance_sd;
+        b->fp[1] = 0.;
+        b->fp[0] = start_sv;
+    #endif
+}
+
+static inline double
+bezier_eval_f(double *c, double x)
+{
+    #if defined(BEZIER_3RD_ORDER)
+        double f = c[4];
+        f = c[3] + x * f;
+        f = c[2] + x * f;
+        f = c[1] + x * f;
+        f = c[0] + x * f;
+    #elif defined(BEZIER_5TH_ORDER)
+        double f = c[6];
+        f = c[5] + x * f;
+        f = c[4] + x * f;
+        f = c[3] + x * f;
+        f = c[2] + x * f;
+        f = c[1] + x * f;
+        f = c[0] + x * f;
+    #endif
+    return f;
+}
+
+static inline double
+bezier_eval_fp(double *c, double x)
+{
+    #if defined(BEZIER_3RD_ORDER)
+        double fp = c[3];
+        fp = c[2] + x * fp;
+        fp = c[1] + x * fp;
+        fp = c[0] + x * fp;
+    #elif defined(BEZIER_5TH_ORDER)
+        double fp = c[5];
+        fp = c[4] + x * fp;
+        fp = c[3] + x * fp;
+        fp = c[2] + x * fp;
+        fp = c[1] + x * fp;
+        fp = c[0] + x * fp;
+    #endif
+    return fp;
+}
+
+static inline double
+bezier_nm_next_x(struct bezier *b, double x)
+{
+    double f = bezier_eval_f(b->f, x);
+    double fp = bezier_eval_fp(b->fp, x);
+    return x - f/fp;
+}
+
+#define NM_MAX_ITER 1000
+static int
+bezier_nm(struct bezier *b, double dist, double l, double h, double max_err, double *x_r)
+{
+    double last_x = .5 * (l + h);
+    int count = NM_MAX_ITER;
+    b->f[0] = -dist;
+    for (;;) {
+        double xn = bezier_nm_next_x(b, last_x);
+        if (xn < last_x) {
+            h = last_x;
+            if (xn <= l)
+                xn = .5 * (l + h);
+        }
+        else {
+            l = last_x;
+            if (xn >= h)
+                xn = .5 * (l + h);
+        }
+        if (fabs(xn - last_x) <= max_err) {
+            //errorf("bezier_step_time converged after %d iterations", NM_MAX_ITER - count + 1);
+            *x_r = xn;
+            return 0;
+        }
+        if (--count < 0) {
+            errorf("bezier_step_time did not converge after %d iterations!", NM_MAX_ITER);
+            return ERROR_RET;
+        }
+        last_x = xn;
+    }
+    return 0;
+}
+
+int32_t
+stepcompress_push_bezier(
+    struct stepcompress *sc, double print_time
+    , double step_offset, double steps, double start_sv, double accel
+    , double advance_sd)
+{
+    //errorf("push_const_bezier oid=%d step_offset=%f steps=%f start_sv=%f accel=%f advance_sd=%f",
+    //       sc->oid, step_offset, steps, start_sv, accel, advance_sd);
+    if (!accel)
+        // Cruising speeds are not impacted by bezier style acceleration
+        return stepcompress_push_const(sc, print_time, step_offset, steps, start_sv, accel);
+
+    // Calculate number of steps to take
+    int ret, sdir = 1;
+    if (steps < 0) {
+        sdir = 0;
+        steps = -steps;
+        step_offset = -step_offset;
+    }
+    int count = steps + .5 - step_offset;
+    if (steps == 0.)
+        return 0;
+    if (count < 0 || count > 10000000) {
+        errorf("push_const_bezier invalid count %d %f %f %f %f %f"
+               , sc->oid, print_time, step_offset, steps
+               , start_sv, accel);
+        return ERROR_RET;
+    }
+
+    // Calculate each step time with 3rd- or 5th-order Bézier curve velocity ramp
+    double end_sv = safe_sqrt(start_sv*start_sv + 2.*accel*steps);
+    double move_time = steps / ((start_sv + end_sv) * .5);
+    double max_err = 1. / (sc->mcu_freq * move_time * 2.);
+    struct bezier b;
+    init_bezier(&b, start_sv, end_sv, advance_sd / move_time);
+    int i, res;
+    if (advance_sd < 0.) {
+        /* We may have multiple roots at certain distances if advance_sd is
+           negative. First, we find the roots of the velocity function. */
+        double z[BEZIER_ORDER * 2], zr[BEZIER_ORDER + 1][2];
+        int n_zr = 0;
+        gsl_poly_complex_workspace *w = gsl_poly_complex_workspace_alloc(BEZIER_ORDER + 1);
+        ret = gsl_poly_complex_solve(b.fp, BEZIER_ORDER + 1, w, z);
+        gsl_poly_complex_workspace_free(w);
+        if (ret != GSL_SUCCESS)
+            return ERROR_RET;
+
+        /* Now we put the real roots of the velocity function in zr in
+           ascending order. This gives us isolating intervals for the
+           roots of the position function at any distance. */
+        for (i = 0; i < BEZIER_ORDER; ++i) {
+            double t = z[i*2];
+            if (z[i*2 + 1] == 0. && t > 0. && t < 1.) {
+                int k;
+                for (k = n_zr; k > 0; --k)
+                    if (t > zr[k - 1][0])
+                        break;
+                if (k < n_zr)
+                    memmove(&(zr[k + 1]), &(zr[k]), (n_zr - k) * sizeof(zr[0]));
+                zr[k][0] = t;
+                zr[k][1] = bezier_eval_f(b.f, t);
+                ++n_zr;
+            }
+        }
+        zr[n_zr][0] = 1.;
+        zr[n_zr][1] = bezier_eval_f(b.f, 1.);
+
+        /* Now we can go though each interval and find each step time using
+           our modified Newton-Raphson method */
+        double last_dist = 0., interval_start = 0., pos_offset = 0.;
+        int last_dir = zr[0][1] > last_dist;
+        int step = last_dir ? 0 : -1;
+        res = 0;
+        for (i = 0; i < n_zr + 1; ++i) {
+            int dir = zr[i][1] > last_dist;
+            if (dir != last_dir)
+                step += dir ? 1 : -1;
+            //errorf("zero_num=%d step=%d interval_start=(%f, %f) interval_end=(%f, %f)", i, step, interval_start, last_dist * move_time, zr[i][0], zr[i][1] * move_time);
+            ret = set_next_step_dir(sc, dir ? sdir : !sdir);
+            if (ret)
+                return ret;
+            struct queue_append qa = queue_append_start(sc, print_time + pos_offset, .5);
+            double last_pos = pos_offset;
+            double dist = (step + .5 + step_offset) / move_time;
+            if (dir) {
+                while (dist <= zr[i][1]) {
+                    double t;
+                    ret = bezier_nm(&b, dist, interval_start, zr[i][0], max_err, &t);
+                    if (ret)
+                        return ret;
+                    double pos = t * move_time;
+                    ret = queue_append(&qa, (pos - pos_offset) * sc->mcu_freq);
+                    if (ret)
+                        return ret;
+                    ++step;
+                    ++res;
+                    last_pos = pos;
+                    dist = (step + .5 + step_offset) / move_time;
+                }
+            }
+            else {
+                while (dist >= zr[i][1]) {
+                    double t;
+                    ret = bezier_nm(&b, dist, interval_start, zr[i][0], max_err, &t);
+                    if (ret)
+                        return ret;
+                    double pos = t * move_time;
+                    ret = queue_append(&qa, (pos - pos_offset) * sc->mcu_freq);
+                    if (ret)
+                        return ret;
+                    --step;
+                    --res;
+                    last_pos = pos;
+                    dist = (step + .5 + step_offset) / move_time;
+                }
+            }
+            last_dist = zr[i][1];
+            interval_start = zr[i][0];
+            last_dir = dir;
+            pos_offset = last_pos;
+            queue_append_finish(qa);
+        }
+    }
+    else {
+        /* There is definitely only one root, so we can use our modified
+           Newton-Raphson method to find it */
+        ret = set_next_step_dir(sc, sdir);
+        if (ret)
+            return ret;
+        struct queue_append qa = queue_append_start(sc, print_time, .5);
+        res = steps + advance_sd + .5 - step_offset;
+        for (i = 0; i < res; ++i) {
+            double dist = (i + .5 + step_offset) / move_time;
+            double t;
+            ret = bezier_nm(&b, dist, 0., 1., max_err, &t);
+            if (ret)
+                return ret;
+            ret = queue_append(&qa, t * move_time * sc->mcu_freq);
+            if (ret)
+                return ret;
+        }
+        queue_append_finish(qa);
+    }
+    //errorf("push_const_bezier count=%d sdir=%d res=%d", count, sdir, sdir ? res : -res);
+    return (sdir ? res : -res);
 }
 
 // Schedule steps using delta kinematics

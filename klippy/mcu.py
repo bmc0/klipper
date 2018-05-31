@@ -23,7 +23,9 @@ class MCU_stepper:
         self._min_stop_interval = 0.
         self._reset_cmd_id = self._get_position_cmd = None
         self._ffi_lib = self._stepqueue = None
-        self._stepcompress_push_const = self._stepcompress_push_delta = None
+        self._stepcompress_push_const = None
+        self._stepcompress_push_bezier = None
+        self._stepcompress_push_delta = None
     def get_mcu(self):
         return self._mcu
     def setup_dir_pin(self, pin_params):
@@ -82,9 +84,11 @@ class MCU_stepper:
                       is not self._ffi_lib.stepcompress_push_const)
         if ignore_move:
             self._stepcompress_push_const = (lambda *args: 0)
+            self._stepcompress_push_bezier = (lambda *args: 0)
             self._stepcompress_push_delta = (lambda *args: 0)
         else:
             self._stepcompress_push_const = self._ffi_lib.stepcompress_push_const
+            self._stepcompress_push_bezier = self._ffi_lib.stepcompress_push_bezier
             self._stepcompress_push_delta = self._ffi_lib.stepcompress_push_delta
         return was_ignore
     def note_homing_start(self, homing_clock):
@@ -121,9 +125,18 @@ class MCU_stepper:
     def step_const(self, print_time, start_pos, dist, start_v, accel):
         inv_step_dist = self._inv_step_dist
         step_offset = self._commanded_pos - start_pos * inv_step_dist
-        count = self._stepcompress_push_const(
+        count = self._stepcompress_push_bezier(
             self._stepqueue, print_time, step_offset, dist * inv_step_dist,
-            start_v * inv_step_dist, accel * inv_step_dist)
+            start_v * inv_step_dist, accel * inv_step_dist, 0.)
+        if count == STEPCOMPRESS_ERROR_RET:
+            raise error("Internal error in stepcompress")
+        self._commanded_pos += count
+    def step_const_adv(self, print_time, start_pos, dist, start_v, accel, advance_d):
+        inv_step_dist = self._inv_step_dist
+        step_offset = self._commanded_pos - start_pos * inv_step_dist
+        count = self._stepcompress_push_bezier(
+            self._stepqueue, print_time, step_offset, dist * inv_step_dist,
+            start_v * inv_step_dist, accel * inv_step_dist, advance_d * inv_step_dist)
         if count == STEPCOMPRESS_ERROR_RET:
             raise error("Internal error in stepcompress")
         self._commanded_pos += count

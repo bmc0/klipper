@@ -11,7 +11,7 @@ import cffi
 # c_helper.so compiling
 ######################################################################
 
-COMPILE_CMD = "gcc -Wall -g -O2 -shared -fPIC -o %s %s"
+COMPILE_CMD = "gcc -Wall -g -O2 -shared -fPIC -lgsl -lgslcblas -lm -o %s %s"
 SOURCE_FILES = ['stepcompress.c', 'serialqueue.c', 'pyhelper.c']
 DEST_LIB = "c_helper.so"
 OTHER_FILES = ['list.h', 'serialqueue.h', 'pyhelper.h']
@@ -29,6 +29,9 @@ defs_stepcompress = """
         , int32_t sdir);
     int32_t stepcompress_push_const(struct stepcompress *sc, double clock_offset
         , double step_offset, double steps, double start_sv, double accel);
+    int32_t stepcompress_push_bezier(struct stepcompress *sc, double clock_offset
+        , double step_offset, double steps, double start_sv, double accel
+        , double advance_sd);
     int32_t stepcompress_push_delta(struct stepcompress *sc
         , double clock_offset, double move_sd, double start_sv, double accel
         , double height, double startxy_sd, double arm_d, double movez_r);
