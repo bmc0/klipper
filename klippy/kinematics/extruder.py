@@ -6,8 +6,6 @@
 import math, logging
 import stepper, homing, chelper
 
-EXTRUDE_DIFF_IGNORE = 1.02
-
 class PrinterExtruder:
     def __init__(self, config, extruder_num):
         self.printer = config.get_printer()
@@ -125,12 +123,6 @@ class PrinterExtruder:
             if not extrude or not prev_extrude:
                 # Extrude move to non-extrude move - disable lookahead
                 return 0.
-            if ((move.extrude_r > prev_move.extrude_r * EXTRUDE_DIFF_IGNORE
-                 or prev_move.extrude_r > move.extrude_r * EXTRUDE_DIFF_IGNORE)
-                and abs(move.move_d * prev_move.extrude_r - extrude) >= .001):
-                # Extrude ratio between moves is too different
-                return 0.
-            move.extrude_r = prev_move.extrude_r
         return move.max_cruise_v2
     def lookahead(self, moves, flush_count, lazy):
         lookahead_t = self.pressure_advance_lookahead_time
